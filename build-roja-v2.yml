@@ -1,0 +1,413 @@
+name: Build ROJA APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate project files
+        run: |
+          mkdir -p app/src/main/java/com/roja/app
+          mkdir -p app/src/main/res/xml
+          mkdir -p app/src/main/res/values
+
+          cat > settings.gradle << 'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "roja"
+          include ':app'
+          EOF
+
+          cat > build.gradle << 'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          EOF
+
+          cat > gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx3g
+          android.useAndroidX=false
+          kotlin.code.style=official
+          EOF
+
+          cat > app/build.gradle << 'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.roja.app'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.roja.app'
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 3
+                  versionName '3.0'
+              }
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+          EOF
+
+          cat > app/src/main/res/values/strings.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="access_desc">Roja reads the screen and taps buttons only when you ask by voice.</string>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/xml/access_config.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canRetrieveWindowContent="true"
+              android:description="@string/access_desc"
+              android:notificationTimeout="200" />
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.speech.RecognitionService" />
+                  </intent>
+                  <intent>
+                      <action android:name="android.intent.action.TTS_SERVICE" />
+                  </intent>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:label="Roja"
+                  android:theme="@android:style/Theme.Material.Light">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".OverlayService"
+                      android:exported="false"
+                      android:foregroundServiceType="microphone" />
+                  <service
+                      android:name=".RojaAccess"
+                      android:exported="false"
+                      android:label="Roja"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/access_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/roja/app/RojaAccess.kt << 'EOF'
+          package com.roja.app
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Intent
+          import android.os.Bundle
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          class RojaAccess : AccessibilityService() {
+
+              companion object {
+                  @Volatile
+                  var instance: RojaAccess? = null
+              }
+
+              override fun onServiceConnected() {
+                  instance = this
+              }
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  instance = null
+                  return super.onUnbind(intent)
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+
+              override fun onInterrupt() {}
+
+              fun readScreen(): String {
+                  val root = rootInActiveWindow ?: return "Cannot read this screen."
+                  val sb = StringBuilder()
+                  walk(root, sb, 0)
+                  return if (sb.isEmpty()) "No readable text on screen." else sb.toString().take(4000)
+              }
+
+              private fun walk(n: AccessibilityNodeInfo?, sb: StringBuilder, depth: Int) {
+                  if (n == null || sb.length > 4000 || depth > 30) return
+                  if (n.isPassword) return
+                  val t = n.text?.toString() ?: n.contentDescription?.toString()
+                  if (!t.isNullOrBlank()) {
+                      sb.append(t)
+                      if (n.isClickable) sb.append(" [button]")
+                      sb.append(" | ")
+                  }
+                  for (i in 0 until n.childCount) {
+                      walk(n.getChild(i), sb, depth + 1)
+                  }
+              }
+
+              fun tapText(text: String): String {
+                  val root = rootInActiveWindow ?: return "No screen available."
+                  val nodes = root.findAccessibilityNodeInfosByText(text)
+                  for (n in nodes) {
+                      var c: AccessibilityNodeInfo? = n
+                      while (c != null && !c.isClickable) c = c.parent
+                      if (c != null) {
+                          c.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                          return "Tapped " + text
+                      }
+                  }
+                  return "Could not find a tappable item named " + text
+              }
+
+              fun typeText(text: String): String {
+                  val root = rootInActiveWindow ?: return "No screen available."
+                  val f = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return "No text field is focused. Tap a text field first."
+                  val args = Bundle()
+                  args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+                  f.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                  return "Typed."
+              }
+
+              private fun findScrollable(n: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+                  if (n == null) return null
+                  if (n.isScrollable) return n
+                  for (i in 0 until n.childCount) {
+                      val r = findScrollable(n.getChild(i))
+                      if (r != null) return r
+                  }
+                  return null
+              }
+
+              fun action(a: String): String {
+                  return when (a) {
+                      "back" -> { performGlobalAction(GLOBAL_ACTION_BACK); "Went back." }
+                      "home" -> { performGlobalAction(GLOBAL_ACTION_HOME); "Went home." }
+                      "recents" -> { performGlobalAction(GLOBAL_ACTION_RECENTS); "Opened recents." }
+                      "notifications" -> { performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS); "Opened notifications." }
+                      "scroll_down" -> {
+                          val s = findScrollable(rootInActiveWindow)
+                          if (s == null) "Nothing to scroll." else {
+                              s.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD); "Scrolled down."
+                          }
+                      }
+                      "scroll_up" -> {
+                          val s = findScrollable(rootInActiveWindow)
+                          if (s == null) "Nothing to scroll." else {
+                              s.performAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD); "Scrolled up."
+                          }
+                      }
+                      else -> "Unknown action."
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/roja/app/Tools.kt << 'EOF'
+          package com.roja.app
+
+          import android.content.Context
+          import android.content.Intent
+          import android.hardware.camera2.CameraCharacteristics
+          import android.hardware.camera2.CameraManager
+          import android.net.Uri
+          import android.provider.AlarmClock
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          object Tools {
+
+              private fun s(desc: String): JSONObject =
+                  JSONObject().put("type", "string").put("description", desc)
+
+              private fun n(desc: String): JSONObject =
+                  JSONObject().put("type", "integer").put("description", desc)
+
+              private fun b(desc: String): JSONObject =
+                  JSONObject().put("type", "boolean").put("description", desc)
+
+              private fun tool(name: String, desc: String, props: JSONObject, required: List<String>): JSONObject {
+                  val schema = JSONObject()
+                      .put("type", "object")
+                      .put("properties", props)
+                      .put("required", JSONArray(required))
+                  return JSONObject()
+                      .put("name", name)
+                      .put("description", desc)
+                      .put("input_schema", schema)
+              }
+
+              fun definitions(): JSONArray {
+                  val a = JSONArray()
+                  a.put(tool("open_app", "Open an installed app by name, for example WhatsApp, YouTube, Camera, Settings, Maps.",
+                      JSONObject().put("name", s("App name")), listOf("name")))
+                  a.put(tool("open_url", "Open any link or URI on the phone: https web pages, YouTube search (https://www.youtube.com/results?search_query=TEXT), maps (https://www.google.com/maps/search/?api=1&query=TEXT), mailto:, geo:, tel:.",
+                      JSONObject().put("url", s("Full URL or URI")), listOf("url")))
+                  a.put(tool("set_timer", "Start a countdown timer.",
+                      JSONObject().put("seconds", n("Length in seconds")).put("label", s("Short label")), listOf("seconds")))
+                  a.put(tool("set_alarm", "Set an alarm clock alarm. Hour is 24-hour format.",
+                      JSONObject().put("hour", n("Hour 0-23")).put("minute", n("Minute 0-59")).put("label", s("Short label")), listOf("hour", "minute")))
+                  a.put(tool("flashlight", "Turn the phone flashlight on or off.",
+                      JSONObject().put("on", b("true to turn on")), listOf("on")))
+                  a.put(tool("call", "Open the phone dialer with a number ready. The user presses call themselves.",
+                      JSONObject().put("number", s("Phone number")), listOf("number")))
+                  a.put(tool("send_sms", "Open the messages app with a number and text ready. The user presses send themselves.",
+                      JSONObject().put("number", s("Phone number")).put("text", s("Message text")), listOf("number", "text")))
+                  a.put(tool("read_screen", "Read the visible text on the phone screen the user is currently looking at. Use this when the user asks what is on the screen, asks to summarise or explain what they are looking at, or before tapping something.",
+                      JSONObject(), listOf()))
+                  a.put(tool("tap_on_screen", "Tap a button or item on the current screen by its visible text.",
+                      JSONObject().put("text", s("Visible text of the item")), listOf("text")))
+                  a.put(tool("type_text", "Type text into the currently focused text field on screen.",
+                      JSONObject().put("text", s("Text to type")), listOf("text")))
+                  a.put(tool("screen_action", "Press a system control. Allowed values: back, home, recents, notifications, scroll_down, scroll_up.",
+                      JSONObject().put("action", s("One of the allowed values")), listOf("action")))
+                  a.put(tool("remember", "Save a lasting fact about the user (name, family, preferences, routines) so you remember it in future chats. Use when the user says remember this or shares an important personal detail.",
+                      JSONObject().put("fact", s("Short fact to remember")), listOf("fact")))
+                  return a
+              }
+
+              fun searchTool(): JSONObject =
+                  JSONObject().put("type", "web_search_20250305").put("name", "web_search").put("max_uses", 3)
+
+              private fun launch(ctx: Context, i: Intent): String {
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                  ctx.startActivity(i)
+                  return "Done."
+              }
+
+              fun execute(ctx: Context, name: String, input: JSONObject): String {
+                  return try {
+                      when (name) {
+                          "open_app" -> openApp(ctx, input.optString("name"))
+                          "open_url" -> launch(ctx, Intent(Intent.ACTION_VIEW, Uri.parse(input.optString("url"))))
+                          "set_timer" -> {
+                              val i = Intent(AlarmClock.ACTION_SET_TIMER)
+                                  .putExtra(AlarmClock.EXTRA_LENGTH, input.optInt("seconds", 60))
+                                  .putExtra(AlarmClock.EXTRA_MESSAGE, input.optString("label", "Roja"))
+                                  .putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+                              launch(ctx, i)
+                          }
+                          "set_alarm" -> {
+                              val i = Intent(AlarmClock.ACTION_SET_ALARM)
+                                  .putExtra(AlarmClock.EXTRA_HOUR, input.optInt("hour", 7))
+                                  .putExtra(AlarmClock.EXTRA_MINUTES, input.optInt("minute", 0))
+                                  .putExtra(AlarmClock.EXTRA_MESSAGE, input.optString("label", "Roja"))
+                                  .putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+                              launch(ctx, i)
+                          }
+                          "flashlight" -> flashlight(ctx, input.optBoolean("on", true))
+                          "call" -> launch(ctx, Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + input.optString("number"))))
+                          "send_sms" -> {
+                              val i = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:" + input.optString("number")))
+                                  .putExtra("sms_body", input.optString("text"))
+                              launch(ctx, i)
+                          }
+                          "read_screen" -> RojaAccess.instance?.readScreen() ?: noAccess()
+                          "tap_on_screen" -> RojaAccess.instance?.tapText(input.optString("text")) ?: noAccess()
+                          "type_text" -> RojaAccess.instance?.typeText(input.optString("text")) ?: noAccess()
+                          "screen_action" -> RojaAccess.instance?.action(input.optString("action")) ?: noAccess()
+                          "remember" -> remember(ctx, input.optString("fact"))
+                          else -> "Unknown tool."
+                      }
+                  } catch (e: Exception) {
+                      "Failed: " + e.message
+                  }
+              }
+
+              private fun noAccess(): String =
+                  "Screen access is not enabled. Ask the user to enable Roja in Accessibility settings."
+
+              private fun openApp(ctx: Context, name: String): String {
+                  val pm = ctx.packageManager
+                  val q = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  val list = pm.queryIntentActivities(q, 0)
+                  val target = name.lowercase()
+                  val match = list.firstOrNull { it.loadLabel(pm).toString().lowercase() == target }
+                      ?: list.firstOrNull { it.loadLabel(pm).toString().lowercase().contains(target) }
+                  if (match == null) return "App not found: " + name
+                  val i = pm.getLaunchIntentForPackage(match.activityInfo.packageName) ?: return "Cannot launch that app."
+                  return launch(ctx, i)
+              }
+
+              private fun flashlight(ctx: Context, on: Boolean): String {
+                  val cm = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                  for (id in cm.cameraIdList) {
+                      val has = cm.getCameraCharacteristics(id).get(CameraCharacteristics.FLASH_INFO_AVAILABLE)
+                      if (has == true) {
+                          cm.setTorchMode(id, on)
+                          return if (on) "Flashlight on." else "Flashlight off."
+                      }
+                  }
+                  return "No flashlight found."
+              }
+
+              private fun remember(ctx: Context, fact: String): String {
+                  if (fact.isBlank()) return "Nothing to remember."
+                  val p = ctx.getSharedPreferences("roja", Context.MODE_PRIVATE)
+                  val arr = try { JSONArray(p.getString("facts", "[]")) } catch (e: Exception) { JSONArray() }
+                  arr.put(fact.trim())
+                  while (arr.length() > 100) arr
